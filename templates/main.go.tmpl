@@ -1,0 +1,175 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
+	"sync"
+	"time"
+
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/benchmark/stats"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/grpclog"
+
+	pb "{{.PkgName}}"
+)
+
+const usageService = {{.UsageService}}
+const usageRPC = {{.UsageRPC}}
+
+var (
+	server            = flag.String("server", "", "The server address")
+	maxConcurrentRPCs = flag.Int("max_concurrent_rpcs", 1, "The max number of concurrent RPCs")
+	duration          = flag.Int("duration", math.MaxInt32, "The duration in seconds to run the benchmark client")
+	trace             = flag.Bool("trace", true, "Whether tracing is on")
+	enableSSL         = flag.Bool("enable_ssl", true, "Whether to use tls")
+	service           = flag.String("service", "{{.DefaultService}}", usageService)
+	rpc               = flag.String("rpc", "{{.DefaultRPC}}", usageRPC)
+	data              = flag.String("data", "{}", "Specifies the data to be sent in JSON")
+)
+
+type testClient struct {
+	unaryCaller func() error
+}
+
+type statusCodes struct {
+	count map[codes.Code]int
+	sync.Mutex
+}
+
+func (sc *statusCodes) Add(err error) {
+	sc.Lock()
+	defer sc.Unlock()
+	sc.count[grpc.Code(err)]++
+}
+
+func (sc *statusCodes) Print(w io.Writer) {
+	fmt.Fprintln(w, "Status Codes")
+	for k, v := range sc.count {
+		fmt.Fprintf(w, "%s: %d\n", k, v)
+	}
+}
+
+func (sc *statusCodes) String() string {
+	var b bytes.Buffer
+	sc.Print(&b)
+	return b.String()
+}
+
+func parseData(b []byte, v interface{}) {
+	if err := json.Unmarshal(b, v); err != nil {
+		grpclog.Fatalf("failed to unmarshal data to send: %v", err)
+	}
+}
+
+func closeLoopUnary(s *stats.Stats, conn *grpc.ClientConn, tc *testClient, sc *statusCodes) {
+	for i := 0; i < 100; i++ {
+		tc.unaryCaller()
+	}
+	ch := make(chan int, *maxConcurrentRPCs*4)
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	wg.Add(*maxConcurrentRPCs)
+
+	for i := 0; i < *maxConcurrentRPCs; i++ {
+		go func() {
+			for range ch {
+				start := time.Now()
+                rpcErr := tc.unaryCaller()
+				elapse := time.Since(start)
+				mu.Lock()
+				s.Add(elapse)
+				mu.Unlock()
+				sc.Add(rpcErr)
+			}
+			wg.Done()
+		}()
+	}
+	// Stop the client when time is up.
+	done := make(chan struct{})
+	go func() {
+		<-time.After(time.Duration(*duration) * time.Second)
+		close(done)
+	}()
+	ok := true
+	for ok {
+		select {
+		case ch <- 0:
+		case <-done:
+			ok = false
+		}
+	}
+	close(ch)
+	wg.Wait()
+	conn.Close()
+	grpclog.Println(s.String())
+	grpclog.Println(sc.String())
+
+}
+
+func main() {
+	flag.Parse()
+	grpc.EnableTracing = *trace
+	go func() {
+		lis, err := net.Listen("tcp", ":0")
+		if err != nil {
+			grpclog.Fatalf("Failed to listen: %v", err)
+		}
+		grpclog.Println("Client profiling address: ", lis.Addr().String())
+		if err := http.Serve(lis, nil); err != nil {
+			grpclog.Fatalf("Failed to serve: %v", err)
+		}
+	}()
+
+	var cc *grpc.ClientConn
+	var err error
+	if *enableSSL {
+		cc, err = grpc.Dial(*server)
+	} else {
+		cc, err = grpc.Dial(*server, grpc.WithInsecure())
+	}
+	if err != nil {
+		grpclog.Fatalf("grpc.Dial(%q) failed to create a ClientConn %v", *server, err)
+	}
+
+	s := stats.NewStats(256)
+	sc := &statusCodes{count: make(map[codes.Code]int)}
+	tc := &testClient{}
+
+	switch *service {
+	{{range $svcName, $svc := .Services -}}
+	case "{{$svcName}}":
+		cli := pb.{{$svc.Factory}}(cc)
+		switch *rpc {
+		{{range $rpcName, $rpc := $svc.RPCs -}}
+		case "{{$rpcName}}":
+			{{if $rpc.Unary -}}
+			in := new(pb.{{$rpc.In}})
+			parseData([]byte(*data), &in)
+			tc.unaryCaller = func() error {
+				_, err := cli.{{$rpcName}}(context.Background(), in)
+				return err
+			}
+			{{- end}}
+			{{- if $rpc.Stream -}}
+			grpclog.Fatalln("Not implemented")
+			{{- end}}
+		{{end -}}
+		}
+	{{end -}}
+	}
+
+	if tc.unaryCaller != nil {
+		closeLoopUnary(s, cc, tc, sc)
+	}
+}
